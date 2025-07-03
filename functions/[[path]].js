@@ -420,37 +420,72 @@ function prependNodeName(link, prefix) {
 function isYamlFormat(text) {
     if (!text || typeof text !== 'string') return false;
 
-    // 检查 YAML 特征标识符
+    console.log('开始检测 YAML 格式，内容长度:', text.length);
+    console.log('内容前 200 字符:', text.substring(0, 200));
+
+    // 检查 YAML 特征标识符（包括 Clash 配置特有字段）
     const yamlIndicators = [
         'proxies:',
         'proxy-providers:',
         'proxy-groups:',
         'rules:',
-        'dns:'
+        'dns:',
+        // Clash 配置特有字段
+        'port:',
+        'socks-port:',
+        'allow-lan:',
+        'mode:',
+        'log-level:',
+        'external-controller:'
     ];
 
     // 检查是否包含至少一个 YAML 特征
-    const hasYamlFeatures = yamlIndicators.some(indicator =>
-        text.includes(indicator)
-    );
+    const hasYamlFeatures = yamlIndicators.some(indicator => {
+        const found = text.includes(indicator);
+        if (found) {
+            console.log('发现 YAML 特征:', indicator);
+        }
+        return found;
+    });
 
-    // 排除明显的 base64 内容（连续的 base64 字符）
-    const isLikelyBase64 = /^[A-Za-z0-9+/=\s]+$/.test(text.trim()) &&
+    // 改进的 base64 排除逻辑
+    // 1. 检查是否主要由 base64 字符组成
+    const base64Pattern = /^[A-Za-z0-9+/=\s\n\r]+$/;
+    const isLikelyBase64 = base64Pattern.test(text.trim()) &&
                           text.length > 100 &&
-                          !text.includes(':');
+                          !text.includes(':') &&
+                          !text.includes('-') &&
+                          !text.includes('{') &&
+                          !text.includes('}');
 
-    return hasYamlFeatures && !isLikelyBase64;
+    // 2. 检查是否包含典型的 YAML 结构字符
+    const hasYamlStructure = text.includes(':') ||
+                            text.includes('- ') ||
+                            text.includes('- {') ||
+                            text.includes('name:');
+
+    console.log('YAML 特征检测结果:', hasYamlFeatures);
+    console.log('Base64 排除检测:', isLikelyBase64);
+    console.log('YAML 结构检测:', hasYamlStructure);
+
+    const result = hasYamlFeatures && !isLikelyBase64 && hasYamlStructure;
+    console.log('最终 YAML 格式检测结果:', result);
+
+    return result;
 }
 
 // --- YAML 节点转换函数 ---
 function convertYamlProxyToNodeLink(proxy) {
     if (!proxy || !proxy.type || !proxy.server || !proxy.port) {
+        console.log('代理配置不完整:', proxy);
         return null;
     }
 
     const name = proxy.name || 'Unknown';
     const server = proxy.server;
     const port = proxy.port;
+
+    console.log(`转换代理节点: ${name} (${proxy.type})`);
 
     try {
         switch (proxy.type.toLowerCase()) {
@@ -483,14 +518,16 @@ function convertYamlProxyToNodeLink(proxy) {
                     add: server,
                     port: port.toString(),
                     id: proxy.uuid || '',
-                    aid: (proxy.alterId || 0).toString(),
+                    aid: (proxy.alterId || proxy.alterid || 0).toString(),
                     net: proxy.network || 'tcp',
                     type: proxy.type || 'none',
                     host: proxy.host || '',
                     path: proxy.path || '',
                     tls: proxy.tls ? 'tls' : '',
-                    sni: proxy.sni || ''
+                    sni: proxy.sni || '',
+                    cipher: proxy.cipher || 'auto'
                 };
+                console.log(`VMess 配置:`, vmessConfig);
                 const vmessJson = JSON.stringify(vmessConfig);
                 const vmessBase64 = btoa(unescape(encodeURIComponent(vmessJson)));
                 return `vmess://${vmessBase64}`;
@@ -648,33 +685,53 @@ async function processProxyProviders(proxyProviders, context, userAgent) {
 // --- YAML 订阅处理函数 ---
 async function processYamlSubscription(text, context, userAgent, subName) {
     try {
+        console.log('开始处理 YAML 订阅，内容长度:', text.length);
+        console.log('订阅名称:', subName);
+
         const yamlData = yaml.load(text);
         if (!yamlData) {
             throw new Error('YAML 解析结果为空');
         }
 
+        console.log('YAML 解析成功，数据结构:', Object.keys(yamlData));
+
         let allNodes = [];
 
         // 处理直接的 proxies 节点
         if (yamlData.proxies && Array.isArray(yamlData.proxies)) {
+            console.log(`发现 proxies 字段，包含 ${yamlData.proxies.length} 个代理配置`);
             const directNodes = yamlData.proxies
-                .map(proxy => convertYamlProxyToNodeLink(proxy))
+                .map((proxy, index) => {
+                    const node = convertYamlProxyToNodeLink(proxy);
+                    if (!node) {
+                        console.log(`第 ${index + 1} 个代理转换失败:`, proxy);
+                    }
+                    return node;
+                })
                 .filter(node => node !== null);
             allNodes.push(...directNodes);
-            console.log(`从 YAML proxies 字段获取到 ${directNodes.length} 个节点`);
+            console.log(`从 YAML proxies 字段成功获取到 ${directNodes.length} 个节点`);
+        } else {
+            console.log('未发现 proxies 字段或格式不正确');
         }
 
         // 处理 proxy-providers
         if (yamlData['proxy-providers']) {
+            console.log('发现 proxy-providers 字段');
             const providerNodes = await processProxyProviders(yamlData['proxy-providers'], context, userAgent);
             allNodes.push(...providerNodes);
             console.log(`从 proxy-providers 获取到 ${providerNodes.length} 个节点`);
+        } else {
+            console.log('未发现 proxy-providers 字段');
         }
 
+        console.log(`YAML 订阅处理完成，总共获取到 ${allNodes.length} 个节点`);
         return allNodes;
 
     } catch (e) {
         console.error('处理 YAML 订阅失败:', e);
+        console.error('错误详情:', e.message);
+        console.error('YAML 内容前 500 字符:', text.substring(0, 500));
         throw e;
     }
 }
