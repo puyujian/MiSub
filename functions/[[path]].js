@@ -7,7 +7,7 @@ const KV_KEY_SETTINGS = 'worker_settings_v1';
 const COOKIE_NAME = 'auth_session';
 const SESSION_DURATION = 8 * 60 * 60 * 1000;
 
-// --- [新] 默认设置中增加通知阈值 ---
+// --- [新] 默认设置中增加通知阈值和负载均衡配置 ---
 const defaultSettings = {
   FileName: 'MiSub',
   mytoken: 'auto',
@@ -15,8 +15,10 @@ const defaultSettings = {
   subConverter: 'url.v1.mk',
   subConfig: 'https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini',
   prependSubName: true,
-  NotifyThresholdDays: 3, 
-  NotifyThresholdPercent: 90 
+  NotifyThresholdDays: 3,
+  NotifyThresholdPercent: 90,
+  enableLoadBalance: false,
+  loadBalanceStrategy: 'round-robin'
 };
 
 const formatBytes = (bytes, decimals = 2) => {
@@ -736,6 +738,212 @@ async function processYamlSubscription(text, context, userAgent, subName) {
     }
 }
 
+// --- Clash 配置生成函数（支持负载均衡）---
+async function generateClashConfig(context, config, userAgent, misubs, subName, loadBalanceStrategy = 'round-robin') {
+    console.log('开始生成 Clash 配置，负载均衡策略:', loadBalanceStrategy);
+
+    // 验证负载均衡策略
+    const validStrategies = ['round-robin', 'consistent-hashing'];
+    if (!validStrategies.includes(loadBalanceStrategy)) {
+        console.warn('无效的负载均衡策略，使用默认策略 round-robin');
+        loadBalanceStrategy = 'round-robin';
+    }
+
+    // 获取所有节点
+    const combinedNodeList = await generateCombinedNodeList(context, config, userAgent, misubs, '');
+    const nodeLines = combinedNodeList.split('\n').filter(line => line.trim());
+
+    if (nodeLines.length === 0) {
+        throw new Error('没有可用的节点');
+    }
+
+    // 解析节点并转换为 Clash 代理格式
+    const proxies = [];
+    const proxyNames = [];
+    const usedNames = new Set(); // 避免重复的节点名称
+
+    for (const nodeLine of nodeLines) {
+        try {
+            const proxy = parseNodeToClashProxy(nodeLine);
+            if (proxy) {
+                // 确保节点名称唯一
+                let uniqueName = proxy.name;
+                let counter = 1;
+                while (usedNames.has(uniqueName)) {
+                    uniqueName = `${proxy.name}_${counter}`;
+                    counter++;
+                }
+                proxy.name = uniqueName;
+                usedNames.add(uniqueName);
+
+                proxies.push(proxy);
+                proxyNames.push(proxy.name);
+            }
+        } catch (e) {
+            console.warn('跳过无效节点:', nodeLine.substring(0, 50) + '...', e.message);
+        }
+    }
+
+    if (proxies.length === 0) {
+        throw new Error('没有有效的代理节点，请检查订阅源');
+    }
+
+    console.log(`成功解析 ${proxies.length} 个代理节点`);
+
+    // 生成代理组
+    const proxyGroups = [
+        {
+            name: '🔄 负载均衡',
+            type: 'load-balance',
+            strategy: loadBalanceStrategy,
+            proxies: proxyNames,
+            url: 'http://www.gstatic.com/generate_204',
+            interval: 300
+        },
+        {
+            name: '🚀 节点选择',
+            type: 'select',
+            proxies: ['🔄 负载均衡', 'DIRECT', ...proxyNames]
+        },
+        {
+            name: '🎯 全球直连',
+            type: 'select',
+            proxies: ['DIRECT', '🚀 节点选择']
+        },
+        {
+            name: '🛑 广告拦截',
+            type: 'select',
+            proxies: ['REJECT', 'DIRECT']
+        }
+    ];
+
+    // 基础规则
+    const rules = [
+        'DOMAIN-SUFFIX,local,DIRECT',
+        'IP-CIDR,127.0.0.0/8,DIRECT',
+        'IP-CIDR,172.16.0.0/12,DIRECT',
+        'IP-CIDR,192.168.0.0/16,DIRECT',
+        'IP-CIDR,10.0.0.0/8,DIRECT',
+        'IP-CIDR,17.0.0.0/8,DIRECT',
+        'IP-CIDR,100.64.0.0/10,DIRECT',
+        'DOMAIN-SUFFIX,cn,🎯 全球直连',
+        'GEOIP,CN,🎯 全球直连',
+        'MATCH,🚀 节点选择'
+    ];
+
+    // 构建完整的 Clash 配置
+    const clashConfig = {
+        port: 7890,
+        'socks-port': 7891,
+        'allow-lan': false,
+        mode: 'rule',
+        'log-level': 'info',
+        'external-controller': '127.0.0.1:9090',
+        proxies: proxies,
+        'proxy-groups': proxyGroups,
+        rules: rules
+    };
+
+    return yaml.dump(clashConfig, {
+        indent: 2,
+        lineWidth: -1,
+        noRefs: true,
+        quotingType: '"',
+        forceQuotes: false
+    });
+}
+
+// --- 节点解析为 Clash 代理格式 ---
+function parseNodeToClashProxy(nodeLink) {
+    const url = new URL(nodeLink);
+    const protocol = url.protocol.slice(0, -1); // 移除末尾的 ':'
+
+    // 从 URL fragment 获取节点名称
+    let name = 'Unknown';
+    if (url.hash) {
+        try {
+            name = decodeURIComponent(url.hash.slice(1));
+        } catch (e) {
+            name = url.hash.slice(1);
+        }
+    }
+
+    // 确保节点名称唯一且符合 Clash 要求
+    name = name.replace(/[^\w\s\-\u4e00-\u9fff]/g, '').trim() || 'Node';
+
+    switch (protocol) {
+        case 'ss': {
+            const auth = atob(url.username);
+            const [method, password] = auth.split(':');
+            return {
+                name: name,
+                type: 'ss',
+                server: url.hostname,
+                port: parseInt(url.port),
+                cipher: method,
+                password: password
+            };
+        }
+
+        case 'vmess': {
+            try {
+                const base64Data = nodeLink.substring('vmess://'.length);
+                const jsonStr = atob(base64Data);
+                const config = JSON.parse(jsonStr);
+
+                // 验证必需字段
+                if (!config.add || !config.port || !config.id) {
+                    throw new Error('VMess 配置缺少必需字段');
+                }
+
+                const proxy = {
+                    name: name,
+                    type: 'vmess',
+                    server: config.add,
+                    port: parseInt(config.port),
+                    uuid: config.id,
+                    alterId: parseInt(config.aid || 0),
+                    cipher: config.scy || 'auto',
+                    network: config.net || 'tcp'
+                };
+
+                // 处理 TLS 配置
+                if (config.tls === 'tls' || config.tls === true) {
+                    proxy.tls = true;
+                    if (config.sni) proxy.servername = config.sni;
+                }
+
+                // 处理 WebSocket 配置
+                if (config.net === 'ws') {
+                    proxy['ws-opts'] = {
+                        path: config.path || '/',
+                        headers: config.host ? { Host: config.host } : {}
+                    };
+                }
+
+                return proxy;
+            } catch (e) {
+                throw new Error(`VMess 节点解析失败: ${e.message}`);
+            }
+        }
+
+        case 'trojan': {
+            return {
+                name: name,
+                type: 'trojan',
+                server: url.hostname,
+                port: parseInt(url.port),
+                password: url.username,
+                sni: url.searchParams.get('sni') || url.hostname
+            };
+        }
+
+        default:
+            console.warn('不支持的协议类型:', protocol);
+            return null;
+    }
+}
+
 // --- 节点列表生成函数 ---
 async function generateCombinedNodeList(context, config, userAgent, misubs, prependedContent = '') {
     const nodeRegex = /^(ss|ssr|vmess|vless|trojan|hysteria2?|hy|hy2|tuic|anytls):\/\//;
@@ -954,6 +1162,31 @@ async function handleMisubRequest(context) {
         fakeNodeString = `trojan://00000000-0000-0000-0000-000000000000@127.0.0.1:443#${encodeURIComponent(fakeNodeName)}`;
     }
 
+    // 检查是否启用负载均衡且目标格式为 Clash
+    if (config.enableLoadBalance && (targetFormat === 'clash' || !targetFormat)) {
+        console.log('检测到负载均衡已启用，直接生成 Clash 配置');
+        try {
+            const clashConfig = await generateClashConfig(
+                context,
+                config,
+                userAgentHeader,
+                targetMisubs,
+                subName,
+                config.loadBalanceStrategy || 'round-robin'
+            );
+
+            const headers = {
+                "Content-Type": "text/plain; charset=utf-8",
+                'Cache-Control': 'no-store, no-cache',
+                "Content-Disposition": `attachment; filename*=utf-8''${encodeURIComponent(subName)}.yaml`
+            };
+            return new Response(clashConfig, { headers });
+        } catch (error) {
+            console.error('生成 Clash 负载均衡配置失败:', error);
+            // 如果生成失败，回退到原有逻辑
+        }
+    }
+
     const combinedNodeList = await generateCombinedNodeList(context, config, userAgentHeader, targetMisubs, fakeNodeString);
     const base64Content = btoa(unescape(encodeURIComponent(combinedNodeList)));
 
@@ -969,7 +1202,7 @@ async function handleMisubRequest(context) {
         const headers = { "Content-Type": "text/plain; charset=utf-8", 'Cache-Control': 'no-store, no-cache' };
         return new Response(base64Content, { headers });
     }
-    
+
     const subconverterUrl = new URL(`https://${effectiveSubConverter}/sub`);
     subconverterUrl.searchParams.set('target', targetFormat);
     subconverterUrl.searchParams.set('url', callbackUrl);
