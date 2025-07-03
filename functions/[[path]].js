@@ -315,16 +315,36 @@ async function handleApiRequest(request, env) {
                     }
                     if (nodeCountResponse.ok) {
                         const text = await nodeCountResponse.text();
-                        let decoded = '';
-                        try {
-                            decoded = atob(text.replace(/\s/g, ''));
-                        } catch {
-                            decoded = text;
+                        let nodeCount = 0;
+
+                        // 检查是否为 YAML 格式
+                        if (isYamlFormat(text)) {
+                            try {
+                                console.log('检测到 YAML 格式，开始计算节点数量');
+                                const yamlNodes = await processYamlSubscription(text, context, 'MiSub-Node-Counter/2.0', 'count');
+                                nodeCount = yamlNodes.length;
+                                console.log(`YAML 格式节点计数: ${nodeCount}`);
+                            } catch (e) {
+                                console.error('YAML 节点计数失败，回退到传统方式:', e);
+                                // 回退到传统计数方式
+                            }
                         }
-                        const lineMatches = decoded.match(/^(ss|ssr|vmess|vless|trojan|hysteria2?|hy|hy2|tuic):\/\//gm);
-                        if (lineMatches) {
-                            result.count = lineMatches.length;
+
+                        // 传统计数方式（如果 YAML 处理失败或不是 YAML 格式）
+                        if (nodeCount === 0) {
+                            let decoded = '';
+                            try {
+                                decoded = atob(text.replace(/\s/g, ''));
+                            } catch {
+                                decoded = text;
+                            }
+                            const lineMatches = decoded.match(/^(ss|ssr|vmess|vless|trojan|hysteria2?|hy|hy2|tuic):\/\//gm);
+                            if (lineMatches) {
+                                nodeCount = lineMatches.length;
+                            }
                         }
+
+                        result.count = nodeCount;
                     }
                 } catch (e) {
                     console.error('Failed to fetch subscription:', e);
@@ -396,6 +416,269 @@ function prependNodeName(link, prefix) {
   return appendToFragment(link, prefix);
 }
 
+// --- YAML 格式检测函数 ---
+function isYamlFormat(text) {
+    if (!text || typeof text !== 'string') return false;
+
+    // 检查 YAML 特征标识符
+    const yamlIndicators = [
+        'proxies:',
+        'proxy-providers:',
+        'proxy-groups:',
+        'rules:',
+        'dns:'
+    ];
+
+    // 检查是否包含至少一个 YAML 特征
+    const hasYamlFeatures = yamlIndicators.some(indicator =>
+        text.includes(indicator)
+    );
+
+    // 排除明显的 base64 内容（连续的 base64 字符）
+    const isLikelyBase64 = /^[A-Za-z0-9+/=\s]+$/.test(text.trim()) &&
+                          text.length > 100 &&
+                          !text.includes(':');
+
+    return hasYamlFeatures && !isLikelyBase64;
+}
+
+// --- YAML 节点转换函数 ---
+function convertYamlProxyToNodeLink(proxy) {
+    if (!proxy || !proxy.type || !proxy.server || !proxy.port) {
+        return null;
+    }
+
+    const name = proxy.name || 'Unknown';
+    const server = proxy.server;
+    const port = proxy.port;
+
+    try {
+        switch (proxy.type.toLowerCase()) {
+            case 'ss': {
+                const method = proxy.cipher || 'aes-256-gcm';
+                const password = proxy.password || '';
+                const auth = btoa(`${method}:${password}`);
+                const fragment = encodeURIComponent(name);
+                return `ss://${auth}@${server}:${port}#${fragment}`;
+            }
+
+            case 'ssr': {
+                const method = proxy.cipher || 'aes-256-cfb';
+                const password = proxy.password || '';
+                const protocol = proxy.protocol || 'origin';
+                const obfs = proxy.obfs || 'plain';
+                const auth = btoa(`${method}:${password}`);
+                const params = new URLSearchParams({
+                    protocol,
+                    obfs,
+                    remarks: name
+                });
+                return `ssr://${auth}@${server}:${port}?${params}`;
+            }
+
+            case 'vmess': {
+                const vmessConfig = {
+                    v: '2',
+                    ps: name,
+                    add: server,
+                    port: port.toString(),
+                    id: proxy.uuid || '',
+                    aid: (proxy.alterId || 0).toString(),
+                    net: proxy.network || 'tcp',
+                    type: proxy.type || 'none',
+                    host: proxy.host || '',
+                    path: proxy.path || '',
+                    tls: proxy.tls ? 'tls' : '',
+                    sni: proxy.sni || ''
+                };
+                const vmessJson = JSON.stringify(vmessConfig);
+                const vmessBase64 = btoa(unescape(encodeURIComponent(vmessJson)));
+                return `vmess://${vmessBase64}`;
+            }
+
+            case 'vless': {
+                const params = new URLSearchParams();
+                if (proxy.network) params.set('type', proxy.network);
+                if (proxy.security) params.set('security', proxy.security);
+                if (proxy.sni) params.set('sni', proxy.sni);
+                if (proxy.host) params.set('host', proxy.host);
+                if (proxy.path) params.set('path', proxy.path);
+
+                const uuid = proxy.uuid || '';
+                const fragment = encodeURIComponent(name);
+                const query = params.toString() ? `?${params}` : '';
+                return `vless://${uuid}@${server}:${port}${query}#${fragment}`;
+            }
+
+            case 'trojan': {
+                const password = proxy.password || '';
+                const params = new URLSearchParams();
+                if (proxy.sni) params.set('sni', proxy.sni);
+                if (proxy.alpn) params.set('alpn', proxy.alpn);
+
+                const fragment = encodeURIComponent(name);
+                const query = params.toString() ? `?${params}` : '';
+                return `trojan://${password}@${server}:${port}${query}#${fragment}`;
+            }
+
+            case 'hysteria':
+            case 'hysteria2':
+            case 'hy':
+            case 'hy2': {
+                const auth = proxy.auth || proxy.password || '';
+                const params = new URLSearchParams();
+                if (proxy.sni) params.set('sni', proxy.sni);
+                if (proxy.alpn) params.set('alpn', proxy.alpn);
+
+                const protocol = proxy.type === 'hysteria2' || proxy.type === 'hy2' ? 'hy2' : 'hysteria';
+                const fragment = encodeURIComponent(name);
+                const query = params.toString() ? `?${params}` : '';
+                return `${protocol}://${auth}@${server}:${port}${query}#${fragment}`;
+            }
+
+            case 'tuic': {
+                const uuid = proxy.uuid || '';
+                const password = proxy.password || '';
+                const params = new URLSearchParams();
+                if (proxy.sni) params.set('sni', proxy.sni);
+                if (proxy.alpn) params.set('alpn', proxy.alpn);
+
+                const fragment = encodeURIComponent(name);
+                const query = params.toString() ? `?${params}` : '';
+                return `tuic://${uuid}:${password}@${server}:${port}${query}#${fragment}`;
+            }
+
+            default:
+                console.warn(`不支持的代理类型: ${proxy.type}`);
+                return null;
+        }
+    } catch (e) {
+        console.error(`转换 YAML 节点失败:`, proxy, e);
+        return null;
+    }
+}
+
+// --- proxy-providers 处理函数 ---
+async function processProxyProviders(proxyProviders, context, userAgent) {
+    if (!proxyProviders || typeof proxyProviders !== 'object') {
+        return [];
+    }
+
+    const allNodes = [];
+
+    for (const [providerName, provider] of Object.entries(proxyProviders)) {
+        if (!provider.url) continue;
+
+        try {
+            console.log(`处理 proxy-provider: ${providerName}, URL: ${provider.url}`);
+
+            const requestHeaders = { 'User-Agent': userAgent };
+            const response = await Promise.race([
+                fetch(new Request(provider.url, {
+                    headers: requestHeaders,
+                    redirect: "follow",
+                    cf: { insecureSkipVerify: true }
+                })),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('Request timed out')), 10000))
+            ]);
+
+            if (!response.ok) {
+                console.error(`获取 proxy-provider ${providerName} 失败: ${response.status}`);
+                continue;
+            }
+
+            let text = await response.text();
+
+            // 尝试 base64 解码
+            try {
+                const decoded = atob(text.replace(/\s/g, ''));
+                if (decoded && decoded.length > 0) {
+                    text = decoded;
+                }
+            } catch (e) {
+                // 不是 base64，使用原始文本
+            }
+
+            let providerNodes = [];
+
+            // 检查是否为 YAML 格式
+            if (isYamlFormat(text)) {
+                try {
+                    const yamlData = yaml.load(text);
+                    if (yamlData && yamlData.proxies && Array.isArray(yamlData.proxies)) {
+                        providerNodes = yamlData.proxies
+                            .map(proxy => convertYamlProxyToNodeLink(proxy))
+                            .filter(node => node !== null);
+                    }
+                } catch (e) {
+                    console.error(`解析 proxy-provider ${providerName} YAML 失败:`, e);
+                }
+            } else {
+                // 处理传统格式（节点链接）
+                const nodeRegex = /^(ss|ssr|vmess|vless|trojan|hysteria2?|hy|hy2|tuic|anytls):\/\//;
+                providerNodes = text.replace(/\r\n/g, '\n').split('\n')
+                    .map(line => line.trim())
+                    .filter(line => nodeRegex.test(line));
+            }
+
+            // 应用 additional-prefix
+            if (provider.override && provider.override['additional-prefix']) {
+                const prefix = provider.override['additional-prefix'];
+                providerNodes = providerNodes.map(node => {
+                    try {
+                        return prependNodeName(node, prefix);
+                    } catch (e) {
+                        console.error(`为节点添加前缀失败:`, e);
+                        return node;
+                    }
+                });
+            }
+
+            allNodes.push(...providerNodes);
+            console.log(`从 proxy-provider ${providerName} 获取到 ${providerNodes.length} 个节点`);
+
+        } catch (e) {
+            console.error(`处理 proxy-provider ${providerName} 失败:`, e);
+        }
+    }
+
+    return allNodes;
+}
+
+// --- YAML 订阅处理函数 ---
+async function processYamlSubscription(text, context, userAgent, subName) {
+    try {
+        const yamlData = yaml.load(text);
+        if (!yamlData) {
+            throw new Error('YAML 解析结果为空');
+        }
+
+        let allNodes = [];
+
+        // 处理直接的 proxies 节点
+        if (yamlData.proxies && Array.isArray(yamlData.proxies)) {
+            const directNodes = yamlData.proxies
+                .map(proxy => convertYamlProxyToNodeLink(proxy))
+                .filter(node => node !== null);
+            allNodes.push(...directNodes);
+            console.log(`从 YAML proxies 字段获取到 ${directNodes.length} 个节点`);
+        }
+
+        // 处理 proxy-providers
+        if (yamlData['proxy-providers']) {
+            const providerNodes = await processProxyProviders(yamlData['proxy-providers'], context, userAgent);
+            allNodes.push(...providerNodes);
+            console.log(`从 proxy-providers 获取到 ${providerNodes.length} 个节点`);
+        }
+
+        return allNodes;
+
+    } catch (e) {
+        console.error('处理 YAML 订阅失败:', e);
+        throw e;
+    }
+}
+
 // --- 节点列表生成函数 ---
 async function generateCombinedNodeList(context, config, userAgent, misubs, prependedContent = '') {
     const nodeRegex = /^(ss|ssr|vmess|vless|trojan|hysteria2?|hy|hy2|tuic|anytls):\/\//;
@@ -436,6 +719,27 @@ async function generateCombinedNodeList(context, config, userAgent, misubs, prep
             ]);
             if (!response.ok) return '';
             let text = await response.text();
+
+            // 检查是否为 YAML 格式
+            if (isYamlFormat(text)) {
+                try {
+                    console.log(`检测到 YAML 格式订阅: ${sub.name || sub.url}`);
+                    const yamlNodes = await processYamlSubscription(text, context, userAgent, sub.name);
+
+                    // 应用订阅名称前缀
+                    const finalNodes = (config.prependSubName && sub.name)
+                        ? yamlNodes.map(node => prependNodeName(node, sub.name))
+                        : yamlNodes;
+
+                    console.log(`YAML 订阅 ${sub.name || sub.url} 处理完成，获得 ${finalNodes.length} 个节点`);
+                    return finalNodes.join('\n');
+                } catch (e) {
+                    console.error(`处理 YAML 订阅失败，回退到传统处理: ${sub.name || sub.url}`, e);
+                    // 继续使用传统处理方式
+                }
+            }
+
+            // 传统处理方式（base64 和节点链接）
             try {
                 const cleanedText = text.replace(/\s/g, '');
                 if (cleanedText.length > 20 && /^[A-Za-z0-9+/=]+$/.test(cleanedText)) {
