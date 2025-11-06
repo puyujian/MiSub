@@ -1664,3 +1664,21 @@ export async function onRequest(context) {
     }
     return next();
 }
+
+// --- [新增] Cloudflare Pages Functions 定时任务入口 ---
+// Pages Functions 需要导出 onScheduled 函数来处理 Cron Triggers
+// 参考文档: https://developers.cloudflare.com/pages/functions/scheduled-functions/
+export async function onScheduled(context) {
+    const { env, cron } = context;
+    console.log(`[MiSub Cron] Triggered by schedule: ${cron}`);
+    
+    try {
+        const response = await handleCronTrigger(env);
+        console.log('[MiSub Cron] Execution completed successfully');
+        return response;
+    } catch (error) {
+        console.error('[MiSub Cron] Execution failed:', error);
+        // 定时任务失败也不抛出异常，避免影响后续执行
+        return new Response(`Cron job failed: ${error.message}`, { status: 500 });
+    }
+}
