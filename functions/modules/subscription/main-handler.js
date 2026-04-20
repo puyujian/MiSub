@@ -26,6 +26,26 @@ function getProfileDownloadCountKey(profile) {
     return `${PROFILE_DOWNLOAD_COUNT_PREFIX}${profile.customId || profile.id}`;
 }
 
+function resolveBrowserFallbackPath(config, isAuthenticated) {
+    if (isAuthenticated) return '/dashboard';
+
+    const rawLoginPath = typeof config?.customLoginPath === 'string' ? config.customLoginPath : '';
+    const normalizedLoginPath = rawLoginPath.trim().replace(/^\/+/, '');
+    return normalizedLoginPath && normalizedLoginPath !== 'login'
+        ? `/${normalizedLoginPath}`
+        : '/login';
+}
+
+function createBrowserFallbackResponse(requestUrl, config, isAuthenticated) {
+    const location = new URL(resolveBrowserFallbackPath(config, isAuthenticated), requestUrl);
+    return new Response(null, {
+        status: 302,
+        headers: {
+            Location: location.toString()
+        }
+    });
+}
+
 function buildTemplateProxyBlock(nodeList) {
     return nodeList
         .split('\n')
@@ -174,6 +194,9 @@ export async function handleMisubRequest(context) {
     if (profileIdentifier) {
         // [修正] 使用 config 變量
         if (!token || token !== config.profileToken) {
+            if (isBrowser) {
+                return createBrowserFallbackResponse(request.url, config, isAuthenticated);
+            }
             return new Response('Invalid Profile Token', { status: 403 });
         }
         currentProfile = allProfiles.find(p => (p.customId && p.customId === profileIdentifier) || p.id === profileIdentifier);
@@ -254,6 +277,9 @@ export async function handleMisubRequest(context) {
     } else {
         // [修正] 使用 config 變量
         if (!token || token !== config.mytoken) {
+            if (isBrowser) {
+                return createBrowserFallbackResponse(request.url, config, isAuthenticated);
+            }
             return new Response('Invalid Token', { status: 403 });
         }
         targetMisubs = allMisubs.filter(s => s.enabled);
