@@ -16,23 +16,36 @@ jobs:
     if: ${{ github.event.repository.fork }}
 
     steps:
-      - name: Checkout target repo
-        uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.SYNC_PAT != '' && secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
-          fetch-depth: 0
-          ref: main
-
-      - name: Configure Git & remotes
+      - name: Validate SYNC_PAT
         env:
           SYNC_PAT: ${{ secrets.SYNC_PAT }}
         run: |
           set -e
+          if [ -z "${SYNC_PAT:-}" ]; then
+            echo "❌ SYNC_PAT 未配置。"
+            echo "此工作流会在上游 main 之上保留当前仓库的 fork-sync.yml，"
+            echo "因此必须使用具备 repo + workflow 权限的 PAT 推送。"
+            exit 1
+          fi
+
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ github.token }}
+          fetch-depth: 0
+          ref: main
+
+      - name: Mirror upstream main
+        env:
+          SYNC_PAT: ${{ secrets.SYNC_PAT }}
+        run: |
+          set -euo pipefail
+
+          CONTROL_WORKFLOW=".github/workflows/fork-sync.yml"
+          LOCAL_WORKFLOW_BACKUP="$(mktemp)"
+
           git config user.name "GitHub Actions Bot"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          # 确保在 main 分支
-          git checkout main || git checkout -b main
 
           # upstream remote：存在则改 URL，不存在则新增
           if git remote get-url upstream >/dev/null 2>&1; then
@@ -41,75 +54,48 @@ jobs:
             git remote add upstream https://github.com/imzyb/MiSub.git
           fi
 
-          # 若配置了带 workflows 权限的 PAT，则强制 origin 使用该令牌推送
-          if [ -n "${SYNC_PAT:-}" ]; then
-            git remote set-url origin "https://x-access-token:${SYNC_PAT}@github.com/${{ github.repository }}.git"
-            echo "✅ 检测到 SYNC_PAT，将使用 PAT 推送（支持工作流文件同步）"
-          else
-            echo "⚠️ 未配置 SYNC_PAT，将使用默认 GITHUB_TOKEN。注意：由于 GitHub 限制，此模式下无法自动同步 .github/workflows 的变更。"
-          fi
+          git remote set-url origin "https://x-access-token:${SYNC_PAT}@github.com/${{ github.repository }}.git"
 
+          git fetch --prune origin
           git fetch --prune upstream
-          git fetch --all
 
-      - name: Merge from upstream and resolve conflicts (prefer upstream)
-        id: merge_attempt
-        run: |
-          # 记录合并前基线，后续用于必要时回滚 workflow 文件
-          BASE_REF=$(git rev-parse HEAD)
-          echo "BASE_REF=$BASE_REF" >> "$GITHUB_ENV"
+          git checkout -B main origin/main
 
-          # 尝试合并 upstream/main
-          if git merge upstream/main --no-ff --no-edit; then
-            echo "🎉 合并成功，无冲突"
+          if git show "origin/main:${CONTROL_WORKFLOW}" > "${LOCAL_WORKFLOW_BACKUP}" 2>/dev/null; then
+            echo "✅ 已备份当前仓库的同步工作流"
           else
-            echo "🚩 合并出现冲突，正在处理..."
-            
-            # 如果存在冲突文件，统一用上游版本（theirs=upstream）
-            CONFLICT_FILES=$(git diff --name-only --diff-filter=U 2>/dev/null || true)
-            if [ -n "$CONFLICT_FILES" ]; then
-              echo "检测到冲突文件：将优先使用上游版本覆盖"
-              for file in $CONFLICT_FILES; do
-                echo "  使用上游版本: $file"
-                git checkout --theirs "$file"
-                git add "$file"
-              done
-            fi
-            
-            # 注意：如果 merge 失败且没有 U 类型冲突（例如只有 D 类型），则继续
-            if [ -f .git/MERGE_HEAD ]; then
-              git commit -m "Auto-sync with upstream (Conflict Resolved) $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')"
-            else
-              echo "无法自动解决的异常合并状态，中断同步以防止历史损坏"
-              git merge --abort || true
-              exit 1
-            fi
+            echo "❌ 无法从 origin/main 读取 ${CONTROL_WORKFLOW}"
+            exit 1
           fi
 
-      - name: Commit and Push (if changed)
-        env:
-          SYNC_PAT: ${{ secrets.SYNC_PAT }}
-        run: |
-          set -e
+          git reset --hard upstream/main
 
-          # 未配置 PAT 时，GITHUB_TOKEN 默认无法更新 workflow 文件，推送前回滚该目录
-          if [ -z "${SYNC_PAT:-}" ]; then
-            if [ -n "${BASE_REF:-}" ] && git ls-tree -d --name-only "$BASE_REF" .github/workflows >/dev/null 2>&1; then
-              git restore --source "$BASE_REF" --staged --worktree .github/workflows || true
-              echo "⚠️ 未配置 SYNC_PAT：已回滚 .github/workflows 变更以避免推送权限错误。"
-            fi
+          mkdir -p "$(dirname "${CONTROL_WORKFLOW}")"
+          cp "${LOCAL_WORKFLOW_BACKUP}" "${CONTROL_WORKFLOW}"
+          git add "${CONTROL_WORKFLOW}"
+          rm -f "${LOCAL_WORKFLOW_BACKUP}"
+
+          DESIRED_TREE="$(git write-tree)"
+          ORIGIN_TREE="$(git rev-parse origin/main^{tree})"
+          ORIGIN_PARENT="$(git rev-parse origin/main^ 2>/dev/null || true)"
+          UPSTREAM_HEAD="$(git rev-parse upstream/main)"
+
+          if [ "${DESIRED_TREE}" = "${ORIGIN_TREE}" ] && [ "${ORIGIN_PARENT}" = "${UPSTREAM_HEAD}" ]; then
+            echo "✨ 当前已是目标状态，无需推送。"
+            exit 0
           fi
 
-          # 检查是否有正在进行的合并（冲突解决后需提交）
-          if [ -f .git/MERGE_HEAD ]; then
-             git commit -m "Auto-sync with upstream (Final Polish) $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')" || true
-          fi
+          git commit -m "Keep fork main mirrored to upstream" \
+            -m "Replace merge-based fork syncing with reset-plus-force-push so upstream rewrites do not accumulate extra merge commits on the fork." \
+            -m "Constraint: The scheduled sync workflow must live in this fork, so fork-sync.yml is intentionally preserved on top of upstream/main." \
+            -m "Rejected: merge upstream/main | leaves the fork permanently ahead after upstream force-push or rollback" \
+            -m "Rejected: mirror .github/workflows exactly | would overwrite the control workflow and stop future scheduled syncs" \
+            -m "Confidence: high" \
+            -m "Scope-risk: moderate" \
+            -m "Reversibility: clean" \
+            -m "Directive: Treat main as a mirror branch; keep custom development off main or it will be overwritten by sync." \
+            -m "Tested: git diff against origin/main and upstream/main in workflow logic" \
+            -m "Not-tested: live GitHub Actions run in this commit context"
 
-          # 检查本地是否领先于远程（即是否有新提交需要推送）
-          # 使用 git status 或 rev-parse 检查
-          if [ -n "$(git status --porcelain=v1)" ] || [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
-             echo "🚀 正在推送变更到仓库..."
-             git push origin main
-          else
-             echo "✨ 本地已是最新版本，无需推送。"
-          fi
+          echo "🚀 正在强制推送 main，使其贴齐 upstream/main 并保留同步工作流..."
+          git push --force-with-lease origin main
