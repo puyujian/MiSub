@@ -3,7 +3,9 @@ import { createPinia } from 'pinia'
 import './assets/main.css'
 import App from './App.vue'
 import router from './router'
+import { setAuthFailureHandler } from './lib/http.js'
 import { handleError, setToastHandler, configureErrorMonitoring } from './utils/errorHandler.js'
+import { useSessionStore } from './stores/session.js'
 import { useToastStore } from './stores/toast.js'
 
 // 全局错误处理
@@ -134,7 +136,9 @@ app.config.errorHandler = (error, instance, info) => {
 
 app.use(pinia)
 const toastStore = useToastStore(pinia)
+const sessionStore = useSessionStore(pinia)
 setToastHandler(toastStore.showToast)
+setAuthFailureHandler(() => sessionStore.handleSessionExpired())
 configureErrorMonitoring({ endpoint: import.meta.env.VITE_ERROR_REPORT_URL })
 app.use(router) // Use Router
 app.mount('#app')
